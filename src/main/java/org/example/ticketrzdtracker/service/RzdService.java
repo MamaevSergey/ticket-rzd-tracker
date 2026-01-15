@@ -230,6 +230,14 @@ public class RzdService {
                     boolean isPlats = typeName.equals("ПЛАЦ") || car.path("CarType").asText().equals("PLATS");
                     boolean isLower = placeName.equals("Нижнее");
 
+                    boolean isLowerSide = placeName.equals("Боковое нижнее");
+
+                    if (isPlats && isLowerSide) {
+                        String carNum = car.path("CarNumber").asText();
+                        String freePlaces = car.path("FreePlaces").asText();
+                        log.info("Найдены нижние боковые места в поезде: {}\nСвободные места: {}", carNum, freePlaces);
+                    }
+
                     if (isPlats && isLower) {
                         String carNum = car.path("CarNumber").asText();
                         String freePlaces = car.path("FreePlaces").asText();
