@@ -220,34 +220,49 @@ public class RzdTelegramBot extends TelegramLongPollingBot {
             return;
         }
 
-        String[] parts = callbackData.split(":", 3);
-        if (parts.length != 3) {
+        String[] parts = callbackData.split(":", 2);
+        if (parts.length != 2) {
             return;
         }
 
         String prefix = parts[0];
         String code = parts[1];
-        String name = parts[2];
+        String stationName = extractButtonText(update, callbackData);
 
         TrackingTask draft = taskDrafts.computeIfAbsent(chatId, k -> new TrackingTask());
 
         if ("ORIGIN".equals(prefix)) {
             draft.setChatId(chatId);
             draft.setOriginCode(code);
-            draft.setOriginStationName(name);
+            draft.setOriginStationName(stationName);
 
             user.setBotState("AWAITING_DEST_INPUT");
             userRepository.save(user);
-            sendText(chatId, "Отправление: " + name + "\n\nВведите город или станцию назначения (например, Санкт-Петербург):");
+            sendText(chatId, "Отправление: *" + stationName + "*\n\nТеперь введите город или станцию назначения (например, Санкт-Петербург):");
 
         } else if ("DEST".equals(prefix)) {
             draft.setDestinationCode(code);
-            draft.setDestinationStationName(name);
+            draft.setDestinationStationName(stationName);
 
             user.setBotState("AWAITING_DATE");
             userRepository.save(user);
-            sendText(chatId, "Назначение: " + name + "\n\nВведите дату поездки в формате ГГГГ-ММ-ДД (например: 2026-10-15):");
+            sendText(chatId, "Назначение: *" + stationName + "*\n\nВведите дату поездки в формате ГГГГ-ММ-ДД (например: 2026-10-15):");
         }
+    }
+
+    private String extractButtonText(Update update, String targetCallbackData) {
+        if (update.getCallbackQuery().getMessage() != null
+                && update.getCallbackQuery().getMessage().getReplyMarkup() != null) {
+            var keyboard = update.getCallbackQuery().getMessage().getReplyMarkup().getKeyboard();
+            for (var row : keyboard) {
+                for (var btn : row) {
+                    if (targetCallbackData.equals(btn.getCallbackData())) {
+                        return btn.getText();
+                    }
+                }
+            }
+        }
+        return "Станция (" + targetCallbackData.split(":")[1] + ")";
     }
 
     private void handleDateInput(long chatId, String text, User user) {

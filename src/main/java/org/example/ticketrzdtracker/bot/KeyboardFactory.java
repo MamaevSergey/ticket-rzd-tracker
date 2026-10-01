@@ -29,7 +29,8 @@ public final class KeyboardFactory {
 
             InlineKeyboardButton button = new InlineKeyboardButton();
             button.setText(station.getDisplayName());
-            button.setCallbackData(callbackPrefix + ":" + station.getCode() + ":" + station.getName());
+            button.setCallbackData(callbackPrefix + ":" + station.getCode());
+
             keyboard.add(Collections.singletonList(button));
 
             if (++count >= 5) {
