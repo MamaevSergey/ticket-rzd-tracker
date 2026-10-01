@@ -1,237 +1,373 @@
 package org.example.ticketrzdtracker.bot;
 
-import org.apache.commons.lang3.StringUtils;
-import org.example.ticketrzdtracker.model.UserSession;
-import org.example.ticketrzdtracker.model.UserState;
-import org.example.ticketrzdtracker.service.TrackingService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.example.ticketrzdtracker.model.TaskStatus;
+import org.example.ticketrzdtracker.model.TrackingTask;
+import org.example.ticketrzdtracker.model.User;
+import org.example.ticketrzdtracker.model.dto.StationSuggestion;
+import org.example.ticketrzdtracker.model.dto.TrainOption;
+import org.example.ticketrzdtracker.repository.TrackingTaskRepository;
+import org.example.ticketrzdtracker.repository.UserRepository;
+import org.example.ticketrzdtracker.service.RzdService;
+import org.example.ticketrzdtracker.service.StationSuggesterService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
-import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
-import org.telegram.telegrambots.meta.api.objects.CallbackQuery;
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
-import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardMarkup;
-import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
-import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.KeyboardRow;
+import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.List;
+import java.time.format.DateTimeParseException;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
+@Slf4j
 @Component
+@RequiredArgsConstructor
 public class RzdTelegramBot extends TelegramLongPollingBot {
-    private final TrackingService trackingService;
+
+    private final StationSuggesterService stationSuggesterService;
+    private final TrackingTaskRepository trackingTaskRepository;
+    private final UserRepository userRepository;
+    private final RzdService rzdService;
+
+    private final Map<Long, TrackingTask> taskDrafts = new ConcurrentHashMap<>();
 
     @Value("${bot.name}")
-    private String botName;
+    private String botUsername;
+
     @Value("${bot.token}")
     private String botToken;
-    @Value("${bot.secret-password}")
-    private String secretPassword;
 
-    public RzdTelegramBot(TrackingService trackingService) {
-        this.trackingService = trackingService;
+    @Override
+    public String getBotUsername() {
+        return botUsername;
     }
 
     @Override
-    public String getBotUsername() { return botName; }
-    @Override
-    public String getBotToken() { return botToken; }
+    public String getBotToken() {
+        return botToken;
+    }
 
     @Override
     public void onUpdateReceived(Update update) {
-
-        // Добавлено только что
         if (update.hasCallbackQuery()) {
-            handleCallback(update.getCallbackQuery());
+            handleCallbackQuery(update);
             return;
         }
 
-        if (!update.hasMessage() || !update.getMessage().hasText()) return;
+        if (update.hasMessage() && update.getMessage().hasText()) {
+            handleTextMessage(update);
+        }
+    }
 
-        String msg = update.getMessage().getText();
-        Long chatId = update.getMessage().getChatId();
-        UserSession session = trackingService.getSession(chatId);
+    private void handleTextMessage(Update update) {
+        String text = update.getMessage().getText().trim();
+        long chatId = update.getMessage().getChatId();
         String username = update.getMessage().getFrom().getUserName();
-        if (msg.equals("/start")) {
-            session.setState(UserState.START);
-            session.setPasswordAttempts(0);
-            String text = """
-                    Привет! Я бот для отслеживания нижних мест в поезде РЖД!
-                    Надеюсь у меня получится тебе помочь!
-                    """;
-            sendInlineKeyboard(chatId, "Привет! Я бот для поиска билетов.", "Начать сессию", "CMD_START_SESSION");
+
+        User user = userRepository.findById(chatId).orElseGet(() ->
+                userRepository.save(new User(chatId, username))
+        );
+
+        if ("/cancel".equalsIgnoreCase(text)) {
+            handleCancelCommand(chatId, user);
             return;
         }
 
-        switch (session.getState()) {
-            case START:
-                sendInlineKeyboard(chatId, "Нажмите кнопку ниже, чтобы начать.", "Начать сессию", "CMD_START_SESSION");
-                break;
+        if ("/tasks".equalsIgnoreCase(text)) {
+            showActiveTasks(chatId);
+            return;
+        }
 
-            case AWAITING_PASSWORD:
-                if (msg.equals(secretPassword)) {
-                    session.setState(UserState.AWAITING_DATA);
-                    String text = String.format("""
-                            Пароль принят!
-                            Введите данные в формате:
-                            Откуда, Куда, Дата(дд.мм.гггг), Время(секунд)
-                            
-                            Пример: "Екатеринбург-Пассажирс, Соликамск, 22.12.2025, 3600"
-                            """);
-                    sendMessage(chatId, text);
+        if ("/start".equalsIgnoreCase(text)) {
+            sendText(chatId, "Бот отслеживает появление нижних полок в плацкарте на поезда РЖД.\n\n" +
+                    "Введите станцию отправления (например, Москва):");
+            user.setBotState("AWAITING_ORIGIN_INPUT");
+            userRepository.save(user);
+            taskDrafts.put(chatId, new TrackingTask());
+            return;
+        }
 
-                } else {
-                    session.setPasswordAttempts(session.getPasswordAttempts() + 1);
-                    if (session.getPasswordAttempts() >= 3) {
-                        session.setState(UserState.START);
-                        sendMessage(chatId, "⛔ Попытки исчерпаны.");
-                        sendInlineKeyboard(chatId, "Попробуйте заново?", "Начать сессию", "CMD_START_SESSION");
-                    } else {
-                        sendMessage(chatId, "Неверно. Осталось попыток: " + (3 - session.getPasswordAttempts()));
-                    }
-                }
-                break;
+        if ("/new".equalsIgnoreCase(text)) {
+            startNewSearch(chatId, user);
+            return;
+        }
 
-            case AWAITING_DATA:
-                try {
-                    String[] parts = msg.split(", ");
-
-                    if (parts.length < 4) throw new IllegalArgumentException();
-
-                    String from = parts[0];
-                    String to = parts[1];
-                    LocalDate.parse(parts[2], DateTimeFormatter.ofPattern("dd.MM.yyyy"));
-
-                    int seconds = Integer.parseInt(parts[3]);
-
-                    if (seconds > 86400) {
-                        seconds = 86400;
-                        String text = String.format("""
-                                Максимум можно установить трекинг на 24 часа.
-                                Ставлю максимальное значение - 86400 секунд.
-                                """);
-                        sendMessage(chatId, text);
-                    }
-
-                    sendMessage(chatId, "Данные приняты. Ищу вокзалы и поезд...");
-
-                    boolean isStarted = trackingService.startTracking(chatId, from, to, parts[2], seconds);
-
-                    if (isStarted) {
-                        sendInlineKeyboard(chatId, "🚀 Мониторинг успешно запущен!", "Остановить", "CMD_STOP_MONITORING");
-                    } else {
-                        // Если не запустилось (не нашел город/поезд), клавиатуру НЕ меняем или возвращаем старую
-                        sendMessage(chatId, "Попробуйте ввести данные еще раз корректно.");
-                    }
-                } catch (Exception exception) {
-                    String text = String.format("""
-                            Упс. Кажется возникла ошибка формата!
-                            Используйте правильный ввод.
-                            
-                            Пример, как нужно: "Город1, Город2, 22.12.2025, 3600"
-                            """);
-                    sendMessage(chatId, text);
-                }
-                break;
-
-            case TRACKING:
-                if (msg.equals("Остановить мониторинг")) {
-                    sendInlineKeyboard(chatId, "Мониторинг активен!", "Остановить", "CMD_STOP_MONITORING");
-                }
-                break;
-
-            case AUTHENTICATED:
-                if (msg.equals("Начать сессию")) {
-                    session.setState(UserState.AWAITING_DATA);
-                    String text = String.format("""
-                            %s, с возвращением!!
-                            Откуда, Куда, Дата(дд.мм.гггг), Время(секунд)
-                            
-                            Пример: "Екатеринбург-Пассажирс, Соликамск, 22.12.2025, 3600"
-                            """, StringUtils.capitalize(username));
-                    sendMessage(chatId, text);
-                } else {
-                    String text = String.format("""
-                            Не понимаю, что вы имеете ввиду...
-                            Если вы хотите продолжить, нажмите на кнопку.
-                            """);
-                    sendInlineKeyboard(chatId, text, "Начать сессию", "CMD_START_SESSION");
-                }
+        switch (user.getBotState()) {
+            case "AWAITING_ORIGIN_INPUT" -> handleStationSearch(chatId, text, "ORIGIN", "отправления");
+            case "AWAITING_DEST_INPUT" -> handleStationSearch(chatId, text, "DEST", "прибытия");
+            case "AWAITING_DATE" -> handleDateInput(chatId, text, user);
+            default -> {
+                user.setBotState("AWAITING_ORIGIN_INPUT");
+                userRepository.save(user);
+                taskDrafts.put(chatId, new TrackingTask());
+                handleStationSearch(chatId, text, "ORIGIN", "отправления");
+            }
         }
     }
 
-    public void sendMessage(Long chatId, String text) {
+    private void startNewSearch(long chatId, User user) {
+        List<TrackingTask> activeTasks = trackingTaskRepository.findAllByChatIdAndStatus(chatId, TaskStatus.ACTIVE);
+        if (!activeTasks.isEmpty()) {
+            TrackingTask active = activeTasks.get(0);
+            sendText(chatId, String.format(
+                    "У вас уже отслеживается маршрут %s → %s (%s).\n" +
+                            "Чтобы задать новый, сначала отмените текущий через /cancel или /tasks.",
+                    active.getOriginStationName(),
+                    active.getDestinationStationName(),
+                    active.getDepartureDate()
+            ));
+            return;
+        }
+
+        user.setBotState("AWAITING_ORIGIN_INPUT");
+        userRepository.save(user);
+        taskDrafts.put(chatId, new TrackingTask());
+        sendText(chatId, "Введите станцию отправления (например, Екатеринбург):");
+    }
+
+    private void handleCancelCommand(long chatId, User user) {
+        taskDrafts.remove(chatId);
+        user.setBotState("IDLE");
+        userRepository.save(user);
+
+        List<TrackingTask> activeTasks = trackingTaskRepository.findAllByChatIdAndStatus(chatId, TaskStatus.ACTIVE);
+        if (activeTasks.isEmpty()) {
+            sendText(chatId, "Активных отслеживаний не найдено.\nДля создания нового поиска отправьте команду /new");
+            return;
+        }
+
+        activeTasks.forEach(task -> task.setStatus(TaskStatus.CANCELLED));
+        trackingTaskRepository.saveAll(activeTasks);
+        sendText(chatId, "Отслеживание отменено.\nТеперь вы можете запустить новый поиск командой /new");
+    }
+
+    private void handleStationSearch(long chatId, String query, String prefix, String directionLabel) {
+        List<StationSuggestion> suggestions = stationSuggesterService.searchStations(query);
+        if (suggestions.isEmpty()) {
+            sendText(chatId, "Станция не найдена. Попробуйте уточнить название:");
+            return;
+        }
+
+        InlineKeyboardMarkup keyboard = KeyboardFactory.createStationPicker(suggestions, prefix);
+        if (keyboard == null) {
+            sendText(chatId, "Не удалось определить точную станцию. Попробуйте ввести другое название:");
+            return;
+        }
+
+        SendMessage message = new SendMessage(String.valueOf(chatId), "Выберите точную станцию " + directionLabel + ":");
+        message.setReplyMarkup(keyboard);
+        executeSafely(message);
+    }
+
+    private void handleCallbackQuery(Update update) {
+        String callbackData = update.getCallbackQuery().getData();
+        long chatId = update.getCallbackQuery().getMessage().getChatId();
+        Integer messageId = update.getCallbackQuery().getMessage().getMessageId();
+
+        User user = userRepository.findById(chatId).orElse(null);
+
+        if (callbackData.startsWith("CANCEL:")) {
+            try {
+                Long taskId = Long.parseLong(callbackData.split(":", 2)[1]);
+                handleCancelTask(chatId, messageId, taskId);
+            } catch (NumberFormatException e) {
+                log.error("Invalid task ID in cancel callback: {}", callbackData);
+            }
+            return;
+        }
+
+        if (callbackData.startsWith("TRAIN:")) {
+            String selectedTrain = callbackData.substring("TRAIN:".length());
+            TrackingTask draft = taskDrafts.remove(chatId);
+            if (draft == null) {
+                sendText(chatId, "Сессия устарела. Начните поиск заново: /new");
+                return;
+            }
+
+            draft.setTrainNumber(selectedTrain);
+            draft.setStatus(TaskStatus.ACTIVE);
+            trackingTaskRepository.save(draft);
+
+            if (user != null) {
+                user.setBotState("IDLE");
+                userRepository.save(user);
+            }
+
+            String trainDisplay = selectedTrain.equalsIgnoreCase("ANY") ? "Любой" : selectedTrain;
+            sendText(chatId, String.format(
+                    "Отслеживание запущено.\n\n" +
+                            "Маршрут: %s → %s\n" +
+                            "Дата: %s\n" +
+                            "Поезд: %s\n" +
+                            "Критерий: Плацкарт, только нижние полки\n\n" +
+                            "Как только место появится, вам придет оповещение.",
+                    draft.getOriginStationName(),
+                    draft.getDestinationStationName(),
+                    draft.getDepartureDate(),
+                    trainDisplay
+            ));
+            return;
+        }
+
+        if (user == null) {
+            return;
+        }
+
+        String[] parts = callbackData.split(":", 3);
+        if (parts.length != 3) {
+            return;
+        }
+
+        String prefix = parts[0];
+        String code = parts[1];
+        String name = parts[2];
+
+        TrackingTask draft = taskDrafts.computeIfAbsent(chatId, k -> new TrackingTask());
+
+        if ("ORIGIN".equals(prefix)) {
+            draft.setChatId(chatId);
+            draft.setOriginCode(code);
+            draft.setOriginStationName(name);
+
+            user.setBotState("AWAITING_DEST_INPUT");
+            userRepository.save(user);
+            sendText(chatId, "Отправление: " + name + "\n\nВведите город или станцию назначения (например, Санкт-Петербург):");
+
+        } else if ("DEST".equals(prefix)) {
+            draft.setDestinationCode(code);
+            draft.setDestinationStationName(name);
+
+            user.setBotState("AWAITING_DATE");
+            userRepository.save(user);
+            sendText(chatId, "Назначение: " + name + "\n\nВведите дату поездки в формате ГГГГ-ММ-ДД (например: 2026-10-15):");
+        }
+    }
+
+    private void handleDateInput(long chatId, String text, User user) {
         try {
-            execute(new SendMessage(chatId.toString(), text));
-        } catch (Exception exception) {
-            exception.printStackTrace();
+            LocalDate date = LocalDate.parse(text);
+            if (date.isBefore(LocalDate.now())) {
+                sendText(chatId, "Дата не может быть в прошлом. Введите дату в формате ГГГГ-ММ-ДД:");
+                return;
+            }
+
+            TrackingTask draft = taskDrafts.get(chatId);
+            if (draft == null || draft.getOriginCode() == null || draft.getDestinationCode() == null) {
+                sendText(chatId, "Сессия устарела. Начните поиск заново: /new");
+                return;
+            }
+
+            draft.setDepartureDate(date);
+            draft.setCarType("ПЛАЦКАРТ_НИЖНИЕ");
+
+            String formattedDate = date.format(DateTimeFormatter.ofPattern("dd.MM.yyyy"));
+            List<TrainOption> trains = rzdService.getAvailableTrains(draft.getOriginCode(), draft.getDestinationCode(), formattedDate);
+
+            if (trains.isEmpty()) {
+                sendText(chatId, "На выбранную дату прямых поездов не найдено. Попробуйте другую дату:");
+                return;
+            }
+
+            user.setBotState("AWAITING_TRAIN_SELECTION");
+            userRepository.save(user);
+
+            SendMessage message = new SendMessage(String.valueOf(chatId), "Выберите поезд для мониторинга:");
+            message.setReplyMarkup(KeyboardFactory.createTrainPicker(trains));
+            executeSafely(message);
+
+        } catch (DateTimeParseException e) {
+            sendText(chatId, "Неверный формат даты. Введите дату в виде ГГГГ-ММ-ДД (например, 2026-10-15):");
         }
     }
 
-    public void sendReplyKeyboard(Long chatId, String text, List<String> buttons) {
-        SendMessage message = new SendMessage(chatId.toString(), text);
-        ReplyKeyboardMarkup keyboardMarkup = new ReplyKeyboardMarkup();
-        List<KeyboardRow> keyboard = new ArrayList<>();
-        KeyboardRow row = new KeyboardRow();
-        buttons.forEach(row::add);
-        keyboard.add(row);
-        keyboardMarkup.setKeyboard(keyboard);
-        keyboardMarkup.setResizeKeyboard(true);
-        message.setReplyMarkup(keyboardMarkup);
+    private void showActiveTasks(long chatId) {
+        List<TrackingTask> tasks = trackingTaskRepository.findAllByChatIdAndStatus(chatId, TaskStatus.ACTIVE);
+        if (tasks.isEmpty()) {
+            sendText(chatId, "У вас нет активных отслеживаний.\nСоздать новый поиск: /new");
+            return;
+        }
+
+        sendText(chatId, "Ваши активные задачи отслеживания:");
+
+        for (TrackingTask task : tasks) {
+            SendMessage message = new SendMessage();
+            message.setChatId(String.valueOf(chatId));
+            message.setText(String.format(
+                    "Задача #%d\n" +
+                            "Маршрут: %s → %s\n" +
+                            "Дата поездки: %s\n" +
+                            "Поезд: %s\n" +
+                            "Тип мест: %s",
+                    task.getId(),
+                    task.getOriginStationName(),
+                    task.getDestinationStationName(),
+                    task.getDepartureDate(),
+                    task.getTrainNumber() != null ? task.getTrainNumber() : "Любой",
+                    task.getCarType() != null ? task.getCarType() : "Любой"
+            ));
+            message.setReplyMarkup(KeyboardFactory.createCancelTaskKeyboard(task.getId()));
+            executeSafely(message);
+        }
+    }
+
+    private void handleCancelTask(long chatId, Integer messageId, Long taskId) {
+        Optional<TrackingTask> taskOpt = trackingTaskRepository.findById(taskId);
+
+        if (taskOpt.isEmpty()) {
+            sendText(chatId, "Задача не найдена.");
+            return;
+        }
+
+        TrackingTask task = taskOpt.get();
+        if (!task.getChatId().equals(chatId)) {
+            sendText(chatId, "У вас нет прав на отмену этой задачи.");
+            return;
+        }
+
+        if (task.getStatus() != TaskStatus.ACTIVE) {
+            sendText(chatId, "Эта задача уже не активна.");
+            return;
+        }
+
+        task.setStatus(TaskStatus.CANCELLED);
+        trackingTaskRepository.save(task);
+
+        EditMessageText editMessage = new EditMessageText();
+        editMessage.setChatId(String.valueOf(chatId));
+        editMessage.setMessageId(messageId);
+        editMessage.setText(String.format(
+                "Задача #%d отменена\nМаршрут: %s → %s (%s)",
+                task.getId(),
+                task.getOriginStationName(),
+                task.getDestinationStationName(),
+                task.getDepartureDate()
+        ));
+        editMessage.setReplyMarkup(null);
+
+        try {
+            execute(editMessage);
+        } catch (TelegramApiException e) {
+            log.error("Failed to edit cancel message: {}", e.getMessage());
+        }
+    }
+
+    public void sendText(long chatId, String text) {
+        SendMessage message = new SendMessage(String.valueOf(chatId), text);
+        executeSafely(message);
+    }
+
+    private void executeSafely(SendMessage message) {
         try {
             execute(message);
-        } catch (Exception exception) {
-            exception.printStackTrace();
+        } catch (TelegramApiException e) {
+            log.error("Failed to send Telegram message: {}", e.getMessage());
         }
     }
-
-    private void handleCallback(CallbackQuery callback) {
-        String data = callback.getData();
-        Long chatId = callback.getMessage().getChatId();
-        UserSession session = trackingService.getSession(chatId);
-
-        AnswerCallbackQuery answer = new AnswerCallbackQuery();
-        answer.setCallbackQueryId(callback.getId());
-        try { execute(answer); } catch (Exception e) {}
-
-        if (data.equals("CMD_START_SESSION")) {
-            session.setState(UserState.AWAITING_PASSWORD);
-            sendMessage(chatId, "\uD83D\uDD12 Введите пароль доступа:");
-        }
-
-        else if (data.equals("CMD_STOP_MONITORING")) {
-            trackingService.stopTracking(chatId);
-            session.setState(UserState.AUTHENTICATED);
-            sendMessage(chatId, "\uD83D\uDED1 Мониторинг остановлен.");
-            sendInlineKeyboard(chatId, "Хотите найти другой билет?", "Начать сессию", "CMD_START_SESSION");
-        }
-    }
-
-    public void sendInlineKeyboard(Long chatId, String text, String btnText, String btnCallbackData) {
-        SendMessage message = new SendMessage(chatId.toString(), text);
-
-        InlineKeyboardMarkup markup = new InlineKeyboardMarkup();
-        List<List<InlineKeyboardButton>> rows = new ArrayList<>();
-        List<InlineKeyboardButton> row = new ArrayList<>();
-
-        var button = new InlineKeyboardButton();
-        button.setText(btnText);
-        button.setCallbackData(btnCallbackData);
-
-        row.add(button);
-        rows.add(row);
-        markup.setKeyboard(rows);
-
-        message.setReplyMarkup(markup);
-        try {
-            execute(message);
-        } catch (Exception exception) {
-            exception.printStackTrace();
-        }
-    }
-
 }

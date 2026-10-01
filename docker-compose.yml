@@ -1,11 +1,35 @@
 version: '3.8'
 
 services:
-  rzd-bot:
-    build: .
-    container_name: rzd-bot
-    restart: always  # Если бот упадет или сервер перезагрузится, он встанет сам
+  postgres:
+    image: postgres:16-alpine
+    container_name: rzd-tracker-postgres
     environment:
-      # Тут можно переопределить настройки, чтобы не хранить их в коде
-      # Но пока берем из application.properties
-      - TZ=Europe/Moscow # Важно для корректного времени в логах
+      POSTGRES_DB: rzd_tracker
+      POSTGRES_USER: tracker_user
+      POSTGRES_PASSWORD: tracker_secret_password
+    ports:
+      - "5532:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U tracker_user -d rzd_tracker" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    container_name: rzd-tracker-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL:
+      SPRING_DATASOURCE_USERNAME:
+      SPRING_DATASOURCE_PASSWORD:
+      BOT_TOKEN:
+      BOT_USERNAME:
+
+volumes:
+  pgdata:
